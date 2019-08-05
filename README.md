@@ -1,10 +1,10 @@
 This R program allows rapid assessment of a variety of machine learning algorithms for classification and regression predictions
 
-#Input files
+# Input files
 	MachineLearning_input.txt: example data file of the values for the workflow. Note that the first column needs to be the chemical identifier (CASRN) and the second column the value to predict(can have NAs but must have some data to train on) 
 	userChemicals.txt: example data file that containes a list of CASRN that the user wants predictions for
 
-#Code files
+# Code files
 	DataInitialCleanup.R: contains functions for the initial steps in data cleanup 
 	deleteHighlyCorrelated.R: functions for the identification and removal of highly correlated variables 
 	deleteNearZeroVariance.R: identifies and deletes variables with near zero variance 
