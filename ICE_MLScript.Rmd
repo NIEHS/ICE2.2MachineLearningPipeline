@@ -1,0 +1,285 @@
+---
+title: "ICE-Machine Learning workflow"
+Date: 06/26/2019
+Note: Uses ICE2.0
+output:
+  html_document:
+    df_print: paged
+Author: ILS
+---
+
+
+The Machine Learning workflow allows the user to build simple predictive models. Users can run the tool by constructing a query of ICE data or user provided data then applying user-selected machine-learning algorithms -- called MLmethods on the code -- to build predictive models and evaluate their performance.
+
+
+# Load Libraries
+```{r}
+library(caret)        # main package
+library(corrplot)     # for examination of variable correlations
+library(DMwR)         # for imputation
+library(dplyr)        # data manipulation
+library(imputeTS)     # for imputation
+library(kernlab)      # svmRadial
+library(kknn)         # k nearest neighbor
+library(party)        # for 'cforest' = Conditional Inference Random Forest
+library(pls)          # partial least squares (pls), Principal Component Analysis (pcr)
+library(reshape)      # for melt
+library(rpart)        # CART (decision tree)
+library(stringr)      # for text detection
+```
+
+# Load Functions
+```{r}
+source("DataInitialCleanup.R")
+source("deleteHighlyCorrelated.R")
+source("deleteNearZeroVariance.R")
+source("MissingValueImpute.R")
+source("MLCreate.R")
+source("MLPredict.R")
+source("PlotTrainingModels.R")
+source("PlotVariableImportance.R")
+```
+
+There is a function that removes rows and columns if they have too many NAs.
+The threshold for deletion, in percent, is given here.
+Rows and columns will be deleted if that have more than DELETE_THRESHOLD_FOR_NA percent NA.
+```{r}
+DELETE_THRESHOLD_FOR_NA <- 33  # percent
+```
+
+# Input Variables
+The pipeline requires a data file (fileIn) that contains the input data with the first column the CASRN and the second column values for the variable to predict and following columns different assay values to be used in developing the model. In order to develop a model, there must be sufficient data to learn from, so use of a training set is required. It is good practice to check that the assay data is not missing for the "to predict" values.
+To separate out the training information from the chemicals for which predictions are desired, the UserChem is also needed by the pipeline. This is a list of casrns (that should be a subset of fileIn) for which predictions are to be generated. 
+```{r}
+
+#this is the input file created using ICE ML using hCLAT and ICCVAM LLNA 2009 chemical list--JAA 6/7/2019
+fileIn <- 'MachineLearning_input.txt'
+# read the dataset used for this analysis
+UserChem <-  'userChemicals.txt' #this needs to be a list of casrns
+
+
+
+# this is a list of all available ML methods
+MLmethods <- c('rpart', 'knn', 'svmRadial', 'cforest', 'pls')
+# output files
+
+Error                       <- 'Error.txt'                      # will contain different text depending on error type
+ModelPerformancePdf         <- 'ModelPerformancePdf.pdf'
+SummaryReport               <- 'SummaryReport.txt'
+PredictionsWithTestData     <- 'PredictionsWithTestData.txt'
+VariableImportancePdf       <- 'VariableImportance.pdf'
+VariableImportancePlotFail  <- 'VariableImportancePlotFail.txt'
+```
+
+# Read in data
+```{r}
+dataIn <- read.table( fileIn, sep = '\t', header = TRUE, na.strings = c("NA", "")) #this is the file that is a list of chemicals from user
+
+Chemicals_in <-  read.table(UserChem, sep='\t', header = FALSE)
+colnames(Chemicals_in)<-"CASRN"
+```
+
+# Data Prepration
+```{r}
+set.seed(123)         # for reproducible results
+
+# Remove non-informative data, data for which all the rows/columns aside from the predictor and labels are NA
+dataCleaned <- DataInitialCleanup(dataIn)
+
+# original Name of what we are trying to predict
+oriName <- colnames(dataCleaned)[2]
+
+# change name of 2nd col to  toPredict
+names(dataCleaned)[2] <- 'toPredict'
+
+toAddBack <- subset(dataCleaned, select =  c(CASRN, toPredict))  # This retains the labels and the value for prediction
+dataTemp <-  subset(dataCleaned, select = -c(toPredict))         # removing the value to be predicted prior to impuation
+
+# Impute NAs here, note that columns and rows will be deleted if more than DELETE_THRESHOLD_FOR_NA percent are NAs
+# MissingValueImpute() will return -1 if dataset is too small for modeling
+# If not enough data for modeling, an error file is written to disk and the ML calculations are skipped by IF loop
+#   and the program exits normally
+
+imputedDataTemp  <- MissingValueImpute(dataTemp, percentDeleteThreshold = DELETE_THRESHOLD_FOR_NA)
+
+dataImputed   <- merge(toAddBack, imputedDataTemp, all.y = TRUE) #this adds back the identifiers
+  #check to see if the user defined chemcials are in the data set still
+Percent_chemical<-round(nrow(subset(dataImputed, dataImputed$CASRN %in% Chemicals_in$CASRN))/length(Chemicals_in$CASRN)*100, 2)
+
+
+```
+
+# Running the Script
+This script goes through the process of developingthe desired models and generating the predictions. If there is insufficient data after imputation and cleanup to go forward, the error file will be written instead of a prediction file. In the event there is sufficient data, a warning will be thrown and can be ignored
+
+```{r}
+
+# NOTE - this IF / ELSE  statement is long, it goes to almost the end of the file and program will exit normally
+#   Ff there is not enough data for modeling a -1 is returned from MissingValueImpute
+
+if(imputedDataTemp == -1) {
+  # return text to web interface, write error file and exit
+  print('Not enough data for modeling.  Please revise your query and try again')
+  cat('Not enough data for modeling.  Please revise your query and try again', file = ErrorOut)
+} else if(Percent_chemical < 0.5){
+    print(paste0("Only ",Percent_chemical, "% of user chemicals remaining after removing sparse values. 50% or more required. Revise query and try again."))
+    cat(paste0("Only ",Percent_chemical, "% of user chemicals remaining after removing sparse values. 50% or more required. Revise query and try again."), file = ErrorOut)
+  } else {
+  # Function deleteHighlyCorrelated only works with numeric data types,
+  #    check if any there are any factor data types and skip this call if there are
+
+  numberFactorDataTypes <- sum(sapply(dataImputed[, 3: ncol(dataImputed)], is.factor))
+
+  if (numberFactorDataTypes > 0) {
+    dataAfterMunging                <- deleteNearZeroVariance(dataImputed)
+  }  else {
+    dataImputedHighlyCorrel         <- deleteHighlyCorrelated(dataImputed)
+    dataAfterMunging                <- deleteNearZeroVariance(dataImputedHighlyCorrel)
+  }
+
+  # This gets the names of columns removed, this will be used in the summary of data that is written to disk by function DataSummaryWriteToDisk()
+  # Need to rename variable 'toPredict' in dataAfterMunging back to original name for this to get original ICE variable name.
+  temp <- dataAfterMunging
+  names(temp)[2] <- oriName
+  colRemoved <- setdiff(colnames(dataIn), colnames(temp ))
+
+
+  if (is.factor(dataAfterMunging $toPredict)) {
+    type <- 'classification'
+  } else {
+    type <- 'regression'
+  }
+
+  ### set up training control
+
+  if (type == "classification") {
+    trn_ctl <- caret::trainControl(
+      method   = "repeatedcv",
+      repeats         = 5,
+      number          = 10,
+      classProbs      = TRUE,
+      summaryFunction = twoClassSummary     # necessary to get confusion matrix
+    )
+    metrics = "ROC"
+  }
+
+  if (type == "regression") {
+    trn_ctl <- caret::trainControl(
+      method   = "repeatedcv",
+      repeats         = 5,
+      number          = 10,
+      savePredictions = TRUE     # saves predictions for all tuning parameters, "final" saves for optimal tuning parameters
+    )
+    metrics = "RMSE"
+  }
+
+
+  # IDs out
+  IDLabel <- dataAfterMunging [, 1]
+
+  dataSet   <-  dataAfterMunging [, 2:ncol(dataAfterMunging )]                      # first column is ID, second is toPredict
+  modelData <-  droplevels(subset(dataSet,!is.na(toPredict) & toPredict != ""))     # modeling data needs to have values for toPredict
+######Begin Modelin
+  # create training and test data
+  inTrain <- caret::createDataPartition(modelData$toPredict,
+                                        p = 0.75,    # % of data in training set
+                                        list=FALSE)  # output is set of integers for rows in the training set
+
+
+  testingData  <- modelData[ -inTrain ,]
+  trainingData <- modelData[  inTrain ,]
+
+
+  # get the list of the chemicals uploaded
+  Chemlist_casrn <- unique(Chemicals_in$CASRN)
+  # get the unique list of the chemicals that was generated by ICE ML pipeline our chemicals + seed chemicals after clean up
+  dataAfterMunging_casrn <- unique(dataAfterMunging$CASRN)
+
+  # comparing the lists with each other and finding wha tpercentage of each list is in another
+  # because the results are binary true/false the mean calculation is the percentage of the ture in regards to the whole
+  # Percent_chemical <- round(mean(Chemlist_casrn %in% dataAfterMunging_casrn)*100)
+  # Percent_chemical <- paste(Percent_chemical, "%", sep="")
+  # get the list of the chemicals retained from the user list
+  chems_retained <- intersect(Chemlist_casrn, dataAfterMunging_casrn)
+  chemicals_retained <- dataAfterMunging$CASRN %in% chems_retained #this returns a true false list of what values match the chems_retained
+
+  #   build models
+  mlList <- MLCreate(
+
+    data               = modelData,
+    User_Chem_list     = Chemicals_in,
+    ML_data            = dataIn,
+    dataAfterMunging   = dataAfterMunging,
+    methods            = MLmethods,
+    trControlParams    = trn_ctl,
+    type               = type,
+    metric             = metrics,
+    PerformanceSummary = TRUE,
+    trainingData       = trainingData,
+    testingData        = testingData,
+    outfile            = SummaryReport
+  )
+
+  # predict data
+  predictions <- MLPredict(data = dataSet, modelList = mlList)
+
+  # dataAfterMunging [, 1]  is the CASRN
+  dataOut           <- cbind(dataAfterMunging [, 1], chemicals_retained, predictions)
+  colnames(dataOut) <- c(colnames(dataAfterMunging )[1], "User provided chemicals",colnames(predictions))
+  colnames(dataOut) <- gsub("toPredict", paste0(oriName, "_groundTruth"), colnames(dataOut)) # change name from "toPredict" to "groundTruth"
+
+  write.table(
+    dataOut,
+    file = PredictionsWithTestData,
+    sep = '\t',
+    row.names = FALSE,
+    col.names = TRUE,
+    quote = FALSE
+  )
+
+  # PDFs generated here
+  PlotTrainingModels(MLmethods, mlList, ModelPerformancePdf)
+  PlotVariableImportance(mlList, VariableImportancePdf, ErrorOut)
+
+  # write training and testing data to disk.
+  # change 'toPredict' col name back to orginal and concatenate '_toPredict' to the end.
+  # For example, col name will be "Uterotrophic.LEL_toPredict"
+  # also add back CASRNs
+
+  testingDataTemp1  <- testingData
+  trainingDataTemp1 <- trainingData
+
+  names(testingDataTemp1)[1]  <- paste0(oriName, '_toPredict')
+  names(trainingDataTemp1)[1] <- paste0(oriName, '_toPredict')
+
+  # Add CASRN column
+
+  testingDataTemp1$CASRN  <- 'casrn to add'
+  trainingDataTemp1$CASRN <- 'casrn to add'
+
+  # move CASRN to col 1 to match input data
+  testingDataTemp1   <- dplyr::select(testingDataTemp1,  CASRN, everything())
+  trainingDataTemp1  <- dplyr::select(trainingDataTemp1, CASRN, everything())
+
+  # change IDLabel from factor to string for adding CASRN later
+  IDLabelAsString <- unlist(lapply(IDLabel, as.character))
+
+  # testing data
+  for(i in 1 : nrow(testingDataTemp1) ){
+    # use  row.name in testingDataTemp1.  Convert to to numeric since I use this as an index for the CASRN in IDLabelAsString.
+    rowID <- as.numeric(row.names(testingDataTemp1)[i])
+    # add CASRN for this row.name
+    testingDataTemp1$CASRN[i] <- IDLabelAsString[rowID]
+  }
+
+  # training data
+  for(i in 1 : nrow(trainingDataTemp1) ){
+    # original row.name.  Convert to to numeric since I use this as an index.
+    rowID <- as.numeric(row.names(trainingDataTemp1)[i])
+    # add CASRN
+    trainingDataTemp1$CASRN[i] <- IDLabelAsString[rowID]
+  }
+
+}
+
+```
